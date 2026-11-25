@@ -1,42 +1,37 @@
 """
 src/data_loader.py
 
-Handles historical price data retrieval via yfinance with automatic local CSV fallbacks.
-Normalizes data schemas into standardized monthly percentage return series aligned strictly
-from a specified start date to the latest available date.
+Handles historical daily return ingestion from a single combined local CSV
+with automatic daily yfinance fallback. Normalizes data schemas into aligned
+daily percentage return series.
 """
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
-import numpy as np
 import pandas as pd
 import yfinance as yf
 
 
-# Default Asset Configuration
+# Default Asset Configuration matching the columns in data/monte_carlo_daily_returns.csv
 DEFAULT_ASSET_CONFIG: Dict[str, Dict[str, Union[str, float]]] = {
-    "Fidelity_Nordic": {
-        "ticker": "0P00000L2O.ST",  # Fidelity Funds - Nordic Fund A-SEK
-        "isin": "SE0000984189",
-        "csv_filename": "SE0000984189.csv",
+    "Fidelity Nordic A-Dis SEK": {
+        "ticker": "0P00000BVI.F",
+        "isin": "LU0048588080",
         "weight": 0.3333,
     },
-    "Nordenfond": {
-        "ticker": "0P00000BVI.F",   # Nordenfond equivalent ticker
-        "isin": "LU0048588080",
-        "csv_filename": "LU0048588080.csv",
+    "SEB Nordenfond A SEK": {
+        "ticker": "0P00000L2O.ST",
+        "isin": "SE0000984189",
         "weight": 0.2500,
     },
-    "BGF_US_Basic_Value": {
-        "ticker": "0P00000BV4.F",   # BlackRock Global Funds US Basic Value A2 USD
+    "BGF US Basic Value A2": {
+        "ticker": "0P00000BV4.F",
         "isin": "LU0072461881",
-        "csv_filename": "LU0072461881.csv",
         "weight": 0.2500,
     },
-    "BGF_Sustainable_Energy": {
-        "ticker": "0P00000CWL.F",   # BlackRock Sustainable Energy A2 USD
-        "isin": "LU0124384867",
-        "csv_filename": "LU0124384867.csv",
+    "BGF Sustainable Energy A2": {
+        "ticker": "0P00000CWL.F",
+        "isin": "LU0171289902",
         "weight": 0.1667,
     },
 }
@@ -44,60 +39,63 @@ DEFAULT_ASSET_CONFIG: Dict[str, Dict[str, Union[str, float]]] = {
 
 class DataLoader:
     """
-    Data ingestion pipeline with yfinance fetching, local CSV fallback,
-    and schema normalization for financial return series.
+    Data ingestion pipeline loading daily returns from a single combined CSV
+    with daily yfinance fetching as a fallback.
     """
 
     def __init__(
         self,
         asset_config: Optional[Dict[str, Dict]] = None,
         data_dir: Union[str, Path] = "data",
+        csv_filename: str = "monte_carlo_daily_returns.csv",
     ):
         self.asset_config = asset_config or DEFAULT_ASSET_CONFIG
         self.data_dir = Path(data_dir)
+        self.csv_path = self.data_dir / csv_filename
 
-    def load_single_asset_csv(self, file_path: Path) -> pd.Series:
+    def load_combined_daily_csv(self, file_path: Optional[Path] = None) -> pd.DataFrame:
         """
-        Loads a single asset return series from a local CSV file.
-        Supports columns: ['date', 'close'] OR ['date', 'return_pct'].
+        Loads a single multi-asset daily return CSV file.
+        Expected format: a 'Date' column plus one column of daily decimal returns per fund.
         """
-        if not file_path.exists():
-            raise FileNotFoundError(f"Local fallback file missing: {file_path}")
+        target_path = Path(file_path) if file_path else self.csv_path
+        if not target_path.exists():
+            raise FileNotFoundError(f"Combined daily returns CSV missing: {target_path}")
 
-        df = pd.read_csv(file_path)
-        df.columns = [col.strip().lower() for col in df.columns]
+        df = pd.read_csv(target_path)
 
-        if "date" not in df.columns:
-            raise KeyError(f"CSV file {file_path.name} must contain a 'date' column.")
+        # Locate the date column case-insensitively
+        date_cols = [col for col in df.columns if col.strip().lower() == "date"]
+        if not date_cols:
+            raise KeyError(f"CSV file {target_path.name} must contain a 'Date' column.")
 
-        df["date"] = pd.to_datetime(df["date"])
-        df = df.sort_values("date").set_index("date")
+        date_col = date_cols[0]
+        df[date_col] = pd.to_datetime(df[date_col])
+        df = df.sort_values(date_col).set_index(date_col)
+        df.index.name = "Date"
 
-        if "return_pct" in df.columns:
-            returns = df["return_pct"].astype(float)
-        elif "close" in df.columns or "adj close" in df.columns:
-            price_col = "adj close" if "adj close" in df.columns else "close"
-            monthly_prices = df[price_col].astype(float).resample("ME").last()
-            returns = monthly_prices.pct_change().dropna()
-        else:
+        expected_cols = list(self.asset_config.keys())
+        missing = [col for col in expected_cols if col not in df.columns]
+        if missing:
             raise KeyError(
-                f"CSV file {file_path.name} must contain either 'close' or 'return_pct' column."
+                f"CSV file {target_path.name} is missing expected fund columns: {missing}. "
+                f"Found columns: {list(df.columns)}"
             )
 
-        return returns
+        return df[expected_cols].astype(float)
 
     def fetch_single_asset_yfinance(
         self, ticker: str, start_date: str, end_date: Optional[str] = None
     ) -> Optional[pd.Series]:
         """
-        Fetches adjusted monthly close prices from yfinance and converts to returns.
+        Fallback: fetches daily adjusted close prices from yfinance and converts to daily returns.
         """
         try:
             data = yf.download(
                 ticker,
                 start=start_date,
                 end=end_date,
-                interval="1mo",
+                interval="1d",
                 progress=False,
                 auto_adjust=True,
             )
@@ -108,70 +106,62 @@ class DataLoader:
             if isinstance(prices, pd.DataFrame):
                 prices = prices.squeeze()
 
-            prices = prices.dropna().resample("ME").last()
+            prices = prices.dropna()
+            prices.index = pd.to_datetime(prices.index).tz_localize(None).normalize()
+            prices = prices[~prices.index.duplicated(keep="last")]
+
             returns = prices.pct_change().dropna()
             return returns if not returns.empty else None
         except Exception:
             return None
 
-    def load_asset_series(
-        self,
-        asset_key: str,
-        start_date: str = "2010-01-01",
-        end_date: Optional[str] = None,
-    ) -> pd.Series:
-        """
-        Retrieves return series for a given asset using yfinance, falling back to CSV.
-        """
-        meta = self.asset_config[asset_key]
-        ticker = meta.get("ticker")
-        csv_name = meta.get("csv_filename", f"{asset_key}.csv")
-        csv_path = self.data_dir / csv_name
-
-        returns = None
-
-        # Attempt 1: Fetch via yfinance
-        if ticker:
-            returns = self.fetch_single_asset_yfinance(ticker, start_date, end_date)
-
-        # Attempt 2: Fallback to Local CSV
-        if returns is None or len(returns) == 0:
-            print(f"[{asset_key}] Yahoo Finance fetch unsuccessful/incomplete. Using fallback: {csv_path}")
-            returns = self.load_single_asset_csv(csv_path)
-
-        # Filter strictly by start_date and end_date bounds
-        returns.index = pd.to_datetime(returns.index)
-        returns = returns[returns.index >= pd.to_datetime(start_date)]
-        if end_date:
-            returns = returns[returns.index <= pd.to_datetime(end_date)]
-
-        returns.name = asset_key
-        return returns
-
     def load_aligned_dataset(
-        self, start_date: str = "2010-01-01", end_date: Optional[str] = None
+        self, start_date: str = "2023-01-01", end_date: Optional[str] = "2026-01-31"
     ) -> Tuple[pd.DataFrame, Dict[str, float]]:
         """
-        Loads return series for all configured assets and aligns them to a shared time window via inner join.
+        Loads daily return series for all configured assets from the single local CSV
+        (or yfinance fallback) and aligns them to the requested date window.
         """
-        series_list: List[pd.Series] = []
-        raw_weights: Dict[str, float] = {}
+        if self.csv_path.exists():
+            print(f"Loading daily returns from local CSV: {self.csv_path}")
+            df_aligned = self.load_combined_daily_csv(self.csv_path)
+        else:
+            print(f"Local CSV not found at {self.csv_path}. Fetching daily data from yfinance...")
+            series_list: List[pd.Series] = []
+            for asset_key, meta in self.asset_config.items():
+                ticker = meta.get("ticker")
+                series = (
+                    self.fetch_single_asset_yfinance(ticker, start_date, end_date)
+                    if ticker
+                    else None
+                )
+                if series is None or series.empty:
+                    raise RuntimeError(
+                        f"Could not load daily data for '{asset_key}' via yfinance and {self.csv_path} is missing."
+                    )
+                series.name = asset_key
+                series_list.append(series)
 
-        for asset_key in self.asset_config:
-            series = self.load_asset_series(asset_key, start_date, end_date)
-            series_list.append(series)
-            raw_weights[asset_key] = float(self.asset_config[asset_key]["weight"])
+            df_aligned = pd.concat(series_list, axis=1).sort_index().ffill().dropna()
 
-        # Inner-join alignment to ensure identical dates across all 4 funds
-        df_aligned = pd.concat(series_list, axis=1, join="inner").sort_index()
+        # Filter strictly by start_date and end_date bounds
+        df_aligned = df_aligned[df_aligned.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df_aligned = df_aligned[df_aligned.index <= pd.to_datetime(end_date)]
+
+        df_aligned = df_aligned.dropna()
 
         # Normalize weights so they sum strictly to 1.0
+        raw_weights = {k: float(v["weight"]) for k, v in self.asset_config.items()}
         total_weight = sum(raw_weights.values())
         normalized_weights = {k: v / total_weight for k, v in raw_weights.items()}
 
-        print(f"\nData Loading Complete:")
-        print(f" - Aligned Window: {df_aligned.index.min().strftime('%Y-%m')} to {df_aligned.index.max().strftime('%Y-%m')}")
-        print(f" - Total Monthly Observations: {len(df_aligned)}")
+        print("\nData Loading Complete:")
+        print(
+            f" - Aligned Window: {df_aligned.index.min().strftime('%Y-%m-%d')} "
+            f"to {df_aligned.index.max().strftime('%Y-%m-%d')}"
+        )
+        print(f" - Total Daily Observations: {len(df_aligned)}")
         print(f" - Normalized Weights: {normalized_weights}\n")
 
         return df_aligned, normalized_weights
